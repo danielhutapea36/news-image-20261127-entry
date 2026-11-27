@@ -1,160 +1,124 @@
 #!/usr/bin/env python3
-"""World News, Friday 27 November 2026 — entry program.
+"""One picture of Friday 27 November 2026's world news.
 
-The finished newspaper image ships in this repository as ``entry.png``
-(1024 by 1024 pixels, drawn offline while the entry was built). Running
-this program copies that image into the output directory, after checking
-that it is a well-formed PNG of the required size. Only the Python
-standard library is used: nothing is fetched from the network, and no
-clock or random source is consulted, so repeated runs produce identical
-bytes.
-
-Run it with an output directory:
+``entry.png`` — a 1024 by 1024 newspaper page drawn offline while this
+entry was built — ships in this repository. This program copies it to
+the output directory. It uses only the standard library, reads nothing
+from the network, and consults neither the clock nor any random source,
+so every run writes the same bytes.
 
     MAKEFUN_OUTPUT_DIR=/tmp/ni27-out python3 main.py
     python3 main.py --out-dir /tmp/ni27-out
-
-Or inspect the committed image without writing anything:
-
     python3 main.py --verify-only
 
-A bad image, a missing file, or an unwritable output directory makes the
-program print an error and exit non-zero instead of writing anything.
+A bad image, a missing file, or an unwritable folder prints an error
+and exits non-zero; a good run exits zero and prints where it wrote.
 """
 
-import argparse
 import hashlib
 import os
-import struct
 import sys
-from pathlib import Path
 
-PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-WANT_WIDTH = 1024
-WANT_HEIGHT = 1024
-BYTE_LIMIT = 1024 * 1024
-IMAGE_FILE = "entry.png"
+MAGIC = bytes((0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A))
+SIDE = 1024
+LIMIT = 1 << 20
+NAME = "entry.png"
 
 
-def bundled_image_path() -> Path:
-    """Where the committed image lives, beside this program."""
-    return Path(__file__).resolve().parent / IMAGE_FILE
+def die(message):
+    sys.stderr.write("error: %s\n" % message)
+    return 1
 
 
-def sha256_hex(blob: bytes) -> str:
-    return hashlib.sha256(blob).hexdigest()
+def picture_size(blob):
+    """Width and height from the IHDR chunk, or ValueError."""
+    if len(blob) < 33 or blob[:8] != MAGIC:
+        raise ValueError("not a PNG file")
+    if int.from_bytes(blob[8:12], "big") != 13 or blob[12:16] != b"IHDR":
+        raise ValueError("first chunk is not a 13-byte IHDR")
+    return (int.from_bytes(blob[16:20], "big"),
+            int.from_bytes(blob[20:24], "big"))
 
 
-def png_dimensions(blob: bytes) -> tuple[int, int]:
-    """Read (width, height) out of the IHDR chunk of a PNG byte string.
-
-    The first eight bytes must be the PNG signature and the first chunk
-    must be a 13-byte IHDR; anything else raises ValueError.
-    """
-    if len(blob) < 8 or blob[:8] != PNG_MAGIC:
-        raise ValueError("not a PNG: wrong magic bytes")
-    if len(blob) < 33:
-        raise ValueError("not a PNG: too short to hold an IHDR chunk")
-    first_len = struct.unpack(">I", blob[8:12])[0]
-    first_kind = blob[12:16]
-    if first_kind != b"IHDR" or first_len != 13:
-        raise ValueError("not a PNG: first chunk is not a 13-byte IHDR")
-    width, height = struct.unpack(">II", blob[16:24])
-    return width, height
+def load_picture():
+    """Read the bundled image and check it against the gate."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), NAME)
+    with open(path, "rb") as handle:
+        blob = handle.read()
+    if len(blob) > LIMIT:
+        raise ValueError("%s is %d bytes, over the 1 MiB limit" % (NAME, len(blob)))
+    width, height = picture_size(blob)
+    if (width, height) != (SIDE, SIDE):
+        raise ValueError("%s is %dx%d, expected %dx%d"
+                         % (NAME, width, height, SIDE, SIDE))
+    return path, blob
 
 
-def read_bundled_image() -> bytes:
-    """Load the committed image, refusing anything outside the gate."""
-    blob = bundled_image_path().read_bytes()
-    if len(blob) > BYTE_LIMIT:
-        raise ValueError(
-            f"{IMAGE_FILE} is {len(blob)} bytes, above the 1 MiB limit"
-        )
-    width, height = png_dimensions(blob)
-    if (width, height) != (WANT_WIDTH, WANT_HEIGHT):
-        raise ValueError(
-            f"{IMAGE_FILE} is {width}x{height}, "
-            f"expected {WANT_WIDTH}x{WANT_HEIGHT}"
-        )
-    return blob
+def parse_flags(argv):
+    """Return (out_dir, verify_only) for --out-dir and --verify-only."""
+    out_dir = None
+    verify_only = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--verify-only":
+            verify_only = True
+        elif arg == "--out-dir":
+            i += 1
+            if i >= len(argv):
+                raise ValueError("--out-dir needs a directory after it")
+            out_dir = argv[i]
+        elif arg.startswith("--out-dir="):
+            out_dir = arg.split("=", 1)[1]
+            if out_dir == "":
+                raise ValueError("--out-dir needs a non-empty directory")
+        elif arg in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            raise ValueError("unknown argument: %s" % arg)
+        i += 1
+    return out_dir, verify_only
 
 
-def pick_output_folder(cli_folder: str | None) -> Path:
-    """Decide where the image goes.
-
-    The --out-dir flag wins. Otherwise $MAKEFUN_OUTPUT_DIR is used, and
-    when that is unset the program writes to /output. An explicitly set
-    but empty $MAKEFUN_OUTPUT_DIR is an error, not a silent default.
-    """
-    if cli_folder:
-        return Path(cli_folder)
-    env_folder = os.environ.get("MAKEFUN_OUTPUT_DIR")
-    if env_folder is not None:
-        if not env_folder:
+def target_folder(flag_dir):
+    """--out-dir wins, then $MAKEFUN_OUTPUT_DIR, then /output."""
+    if flag_dir:
+        return flag_dir
+    env_dir = os.environ.get("MAKEFUN_OUTPUT_DIR")
+    if env_dir is not None:
+        if env_dir == "":
             raise ValueError("MAKEFUN_OUTPUT_DIR is set but empty")
-        return Path(env_folder)
-    return Path("/output")
+        return env_dir
+    return "/output"
 
 
-def store_image(blob: bytes, folder: Path) -> Path:
-    """Write the image bytes out and read them back to prove the copy."""
-    folder.mkdir(parents=True, exist_ok=True)
-    destination = folder / IMAGE_FILE
-    with open(destination, "wb") as handle:
-        handle.write(blob)
-    if destination.read_bytes() != blob:
-        raise ValueError(f"wrote {destination} but the bytes differ")
-    return destination
-
-
-def describe_write(destination: Path, blob: bytes) -> str:
-    """One-line summary of a successful run: path, size and digest."""
-    width, height = png_dimensions(blob)
-    return (
-        f"wrote {destination}: {width}x{height}, {len(blob)} bytes, "
-        f"sha256={sha256_hex(blob)}"
-    )
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Copy the news-image-20261127 entry image to the output directory."
-    )
-    parser.add_argument(
-        "--out-dir",
-        default=None,
-        help="output directory (overrides $MAKEFUN_OUTPUT_DIR)",
-    )
-    parser.add_argument(
-        "--verify-only",
-        action="store_true",
-        help="validate the committed image without writing anything",
-    )
-    return parser
-
-
-def run(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def main(argv):
     try:
-        blob = read_bundled_image()
+        out_dir, verify_only = parse_flags(argv)
+        path, blob = load_picture()
     except (OSError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    if args.verify_only:
-        print(
-            f"verified {bundled_image_path()}: {len(blob)} bytes, "
-            f"sha256={sha256_hex(blob)}"
-        )
+        return die(str(exc))
+    digest = hashlib.sha256(blob).hexdigest()
+    if verify_only:
+        print("verified %s: %d bytes, sha256=%s" % (path, len(blob), digest))
         return 0
     try:
-        folder = pick_output_folder(args.out_dir)
-        destination = store_image(blob, folder)
+        folder = target_folder(out_dir)
+        os.makedirs(folder, exist_ok=True)
+        destination = os.path.join(folder, NAME)
+        with open(destination, "wb") as handle:
+            handle.write(blob)
+        with open(destination, "rb") as handle:
+            if handle.read() != blob:
+                raise ValueError("wrote %s but the bytes differ" % destination)
     except (OSError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    print(describe_write(destination, blob))
+        return die(str(exc))
+    width, height = picture_size(blob)
+    print("wrote %s: %dx%d, %d bytes, sha256=%s"
+          % (destination, width, height, len(blob), digest))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    sys.exit(main(sys.argv[1:]))
